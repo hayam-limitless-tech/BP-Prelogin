@@ -62,6 +62,7 @@ def last_user_message(messages: List[ChatMessage]) -> str:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionsRequest):
+    print("BP request stream =", body.stream)
     user_text = last_user_message(body.messages).strip()
     if not user_text:
         # BP sometimes calls with an empty user turn (preflight / warm-up).
