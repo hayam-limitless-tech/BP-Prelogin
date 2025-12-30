@@ -1,34 +1,21 @@
-"""
-adapter.py
-
-OpenAI-compatible /v1/chat/completions adapter in front of Lili's
-POST /api/user-scope/website-chat/ endpoint.
-
-Supports:
-- Non-streaming JSON response
-- Streaming SSE response (adapter-level streaming by chunking final text)
-
-Environment variables:
-- LILI_API_BASE (default: https://backend-lili-demo.limitless-tech.ai/api)
-- LILI_WORKFLOW_ID (default: 213)
-- LILI_TIMEOUT_SECONDS (default: 60)
-- STREAM_CHUNK_SIZE (default: 40)  # characters per SSE chunk
-"""
-from fastapi.responses import HTMLResponse
 import json
-import os
 import time
 import uuid
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Optional
+import os
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-app = FastAPI(title="BP PoC Adapter", version="1.0.0")
+app = FastAPI(title="BP PoC Adapter", version="1.0.2")
 
-LILI_API_BASE = os.getenv("LILI_API_BASE", "https://backend-lili-demo.limitless-tech.ai/api").rstrip("/")
+LILI_API_BASE = os.getenv(
+    "LILI_API_BASE",
+    "https://backend-lili-demo.limitless-tech.ai/api"
+).rstrip("/")
+
 LILI_WORKFLOW_ID = os.getenv("LILI_WORKFLOW_ID", "213")
 LILI_TIMEOUT_SECONDS = float(os.getenv("LILI_TIMEOUT_SECONDS", "60"))
 STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "40"))
@@ -36,99 +23,71 @@ STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "40"))
 LILI_ENDPOINT = f"{LILI_API_BASE}/user-scope/website-chat/"
 
 
-# -----------------------------
-# Pydantic models (OpenAI-like)
-# -----------------------------
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+    model_config = ConfigDict(extra="allow")
+    role: str
+    content: Any
 
 
 class ChatCompletionsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     model: str = "lili-workflow"
     messages: List[ChatMessage] = Field(min_length=1)
     stream: bool = False
-    user: Optional[str] = None  # optional stable session id
+    user: Optional[str] = None
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+def _extract_text_from_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
 def last_user_message(messages: List[ChatMessage]) -> str:
     for m in reversed(messages):
-        if m.role == "user" and m.content:
-            return m.content
+        if (m.role or "").lower() == "user":
+            txt = _extract_text_from_content(m.content)
+            if txt:
+                return txt
     return ""
 
 
-def chunk_text(text: str, chunk_size: int) -> List[str]:
-    if chunk_size <= 0:
-        return [text]
-    return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
-
-
-# -----------------------------
-# Health check
-# -----------------------------
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "lili_endpoint": LILI_ENDPOINT,
-        "workflow_id": LILI_WORKFLOW_ID,
-    }
-
-
-# -----------------------------
-# Main endpoint
-# -----------------------------
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionsRequest):
     user_text = last_user_message(body.messages).strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="No user message found in messages[]")
 
-    # If you want stable conversation memory in Lili across turns,
-    # pass a consistent `user` from the caller; otherwise this will be random per request.
     sender_id = (body.user or str(uuid.uuid4())).strip()
 
-    payload = {
-        "workflow_id": str(LILI_WORKFLOW_ID),
+    payload: Dict[str, Any] = {
+        "workflow_id": "213",          # or LILI_WORKFLOW_ID
         "sender_id": sender_id,
         "user_message": user_text,
+        # IMPORTANT: turn on streaming upstream
+        "stream": bool(body.stream),   # rename to "streaming" if Lili expects that
     }
-
-    # Call Lili (non-streaming upstream)
-    try:
-        async with httpx.AsyncClient(timeout=LILI_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                LILI_ENDPOINT,
-                json=payload,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                },
-            )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Upstream Lili request failed: {str(e)}") from e
-
-    if resp.status_code >= 400:
-        # Return a 502 because the adapter is functioning but upstream failed
-        raise HTTPException(status_code=502, detail=f"Lili error {resp.status_code}: {resp.text}")
-
-    # Parse response
-    try:
-        data = resp.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Lili returned non-JSON: {resp.text}") from e
-
-    assistant_text = (data.get("message") or data.get("error") or "").strip()
 
     created = int(time.time())
     stream_id = f"chatcmpl-{uuid.uuid4().hex}"
 
-    # Non-streaming response
+    # Non-streaming path
     if not body.stream:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(LILI_ENDPOINT, json=payload)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Lili error {resp.status_code}: {resp.text}")
+        data = resp.json()
+        assistant_text = (data.get("message") or data.get("error") or "").strip()
+
         return JSONResponse(
             {
                 "id": stream_id,
@@ -145,47 +104,72 @@ async def chat_completions(body: ChatCompletionsRequest):
             }
         )
 
-    # Streaming SSE response (adapter-level streaming)
-    async def sse_gen():
-        # Some clients like to see role once; harmless to include in first event.
-        first = True
-        for part in chunk_text(assistant_text, STREAM_CHUNK_SIZE):
-            delta_obj = {"content": part}
-            if first:
-                delta_obj["role"] = "assistant"
-                first = False
+    # Streaming path (proxy)
+    async def sse_proxy():
+        # Emit an initial chunk with role (many clients tolerate/like this)
+        init_event = {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": body.model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(init_event, ensure_ascii=False)}\n\n"
 
-            event = {
-                "id": stream_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": body.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": delta_obj,
-                        "finish_reason": None,
+        async with httpx.AsyncClient(timeout=None) as client:
+            # NOTE: use .stream() to avoid buffering the whole response
+            async with client.stream("POST", LILI_ENDPOINT, json=payload) as resp:
+                if resp.status_code >= 400:
+                    err_text = await resp.aread()
+                    raise HTTPException(status_code=502, detail=f"Lili error {resp.status_code}: {err_text.decode(errors='replace')}")
+
+                # The key part: iterate incremental data from Lili
+                # This assumes Lili returns SSE or line-delimited JSON/text.
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+
+                    # If Lili returns SSE lines like: "data: {...}"
+                    if line.startswith("data:"):
+                        line = line[len("data:"):].strip()
+
+                    # Common terminators
+                    if line in ("[DONE]", "DONE"):
+                        break
+
+                    # Try to parse JSON. If it’s plain text token, fall back to raw.
+                    token = None
+                    try:
+                        obj = json.loads(line)
+                        # Adjust these keys to match Lili’s streaming format:
+                        # e.g. {"delta":"مرحباً"} or {"token":"..."} or {"text":"..."}
+                        token = obj.get("delta") or obj.get("token") or obj.get("text")
+                        if token is None and isinstance(obj, str):
+                            token = obj
+                    except Exception:
+                        token = line
+
+                    if not token:
+                        continue
+
+                    event = {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": body.model,
+                        "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
                     }
-                ],
-            }
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-        # Final stop chunk
+        # Final stop chunk + DONE
         final_event = {
             "id": stream_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": body.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }
-            ],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
-        yield f"data: {json.dumps(final_event)}\n\n"
+        yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(sse_gen(), media_type="text/event-stream")
-
+    return StreamingResponse(sse_proxy(), media_type="text/event-stream")
