@@ -173,3 +173,19 @@ async def chat_completions(body: ChatCompletionsRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(sse_proxy(), media_type="text/event-stream")
+
+import logging
+from fastapi.responses import JSONResponse
+from fastapi import HTTPException, Request
+
+logger = logging.getLogger("uvicorn.error")
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # Logs full context for Railway
+    try:
+        raw = await request.body()
+        logger.error(f"HTTPException {exc.status_code} on {request.url.path} detail={exc.detail} body={raw.decode('utf-8', errors='replace')}")
+    except Exception:
+        logger.error(f"HTTPException {exc.status_code} on {request.url.path} detail={exc.detail} (could not read body)")
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
