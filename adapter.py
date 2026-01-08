@@ -129,6 +129,8 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionsRequest):
     print("BP request stream =", body.stream)
+     # TEMP DEBUG: log candidate session headers
+    logger.info("headers=%s", dict(request.headers))
 
     user_text = last_user_message(body.messages).strip()
 
