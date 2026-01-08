@@ -4,7 +4,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 import os
 import logging
-import haslib
+import hashlib
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
