@@ -4,6 +4,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 import os
 import logging
+import haslib
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -104,6 +105,30 @@ def _empty_chat_completion(model: str) -> Dict[str, Any]:
         ],
     }
 
+def stable_sender_id(body: ChatCompletionsRequest, request: Request) -> str:
+    # 1) Prefer explicit user field (if BP sends it)
+    if body.user and body.user.strip():
+        return body.user.strip()
+
+    h = request.headers
+
+    # 2) Prefer stable session headers if BP provides any (you’ll see in your logs)
+    for key in (
+        "x-session-id",
+        "x-call-id",
+        "x-conversation-id",
+        "x-livekit-room",
+        "x-livekit-room-name",
+    ):
+        v = h.get(key)
+        if v and v.strip():
+            return v.strip()
+
+    # 3) Last resort: deterministic fingerprint (better than per-turn uuid)
+    client_ip = request.client.host if request.client else "unknown"
+    ua = h.get("user-agent", "unknown")
+    fp = f"{client_ip}|{ua}"
+    return hashlib.sha256(fp.encode("utf-8")).hexdigest()[:32]
 
 # -----------------------------
 # Exception logging (keeps Railway logs useful)
@@ -127,7 +152,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 # Main endpoint
 # -----------------------------
 @app.post("/v1/chat/completions")
-async def chat_completions(body: ChatCompletionsRequest):
+async def chat_completions(body: ChatCompletionsRequest, request: Request):
     print("BP request stream =", body.stream)
      # TEMP DEBUG: log candidate session headers
     logger.info("headers=%s", dict(request.headers))
@@ -172,7 +197,7 @@ async def chat_completions(body: ChatCompletionsRequest):
             },
         )
 
-    sender_id = (body.user or str(uuid.uuid4())).strip()
+    sender_id = stable_sender_id(body, request)
 
     payload: Dict[str, Any] = {
         "workflow_id": str(LILI_WORKFLOW_ID),
