@@ -20,7 +20,7 @@ LILI_API_BASE = os.getenv(
     "https://backend-lili-demo.limitless-tech.ai/api"
 ).rstrip("/")
 
-LILI_WORKFLOW_ID = os.getenv("LILI_WORKFLOW_ID", "198")
+LILI_WORKFLOW_ID = os.getenv("LILI_WORKFLOW_ID", "213")
 LILI_TIMEOUT_SECONDS = float(os.getenv("LILI_TIMEOUT_SECONDS", "60"))
 
 LILI_ENDPOINT = f"{LILI_API_BASE}/user-scope/website-chat/"
