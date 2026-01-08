@@ -156,6 +156,9 @@ async def chat_completions(body: ChatCompletionsRequest, request: Request):
     print("BP request stream =", body.stream)
      # TEMP DEBUG: log candidate session headers
     logger.info("headers=%s", dict(request.headers))
+    logger.info("BODY.user=%r", getattr(body, "user", None))
+    logger.info("BODY.user=%r", body.user)
+    logger.info("BODY keys=%s", list(body.model_dump().keys()))
 
     user_text = last_user_message(body.messages).strip()
 
