@@ -1,36 +1,55 @@
+"""
+adapter.py
+
+BP-focused OpenAI-compatible adapter endpoint:
+  POST /v1/chat/completions
+
+What it does:
+- Accepts Beyond Presence (BP) OpenAI-style requests (AsyncOpenAI client)
+- Extracts the last user message
+- Calls Lili upstream: POST {LILI_API_BASE}/user-scope/website-chat/
+- Returns OpenAI-style JSON (stream=false) or SSE (stream=true)
+
+Design choices for BP reliability:
+- BP uses stream=true; we do NOT attempt to proxy Lili streaming format.
+  Instead we call Lili non-streaming and emit exactly one SSE content chunk.
+  This avoids “role-only” streams (silent avatar) when upstream streaming format differs.
+- Stable sender_id per “session” using x-forwarded-for + user-agent (since BP does not send body.user).
+"""
+
+import hashlib
 import json
+import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional
-import os
-import logging
-import hashlib
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-app = FastAPI(title="BP PoC Adapter", version="1.0.3")
+app = FastAPI(title="BP PoC Adapter", version="1.1.0")
+
+logger = logging.getLogger("uvicorn.error")
 
 # -----------------------------
 # Config
 # -----------------------------
-LILI_API_BASE = os.getenv(
-    "LILI_API_BASE",
-    "https://backend-lili-demo.limitless-tech.ai/api"
-).rstrip("/")
-
-LILI_WORKFLOW_ID = os.getenv("LILI_WORKFLOW_ID", "56")
-LILI_TIMEOUT_SECONDS = float(os.getenv("LILI_TIMEOUT_SECONDS", "60"))
-
+LILI_API_BASE = os.getenv("LILI_API_BASE", "https://backend-lili-demo.limitless-tech.ai/api").rstrip("/")
 LILI_ENDPOINT = f"{LILI_API_BASE}/user-scope/website-chat/"
 
-logger = logging.getLogger("uvicorn.error")
+# IMPORTANT:
+# Railway env vars override code defaults. If you set LILI_WORKFLOW_ID in Railway,
+# it will take precedence over what you put here.
+LILI_WORKFLOW_ID = os.getenv("LILI_WORKFLOW_ID", "56")
 
+# Adapter -> Lili timeout
+LILI_TIMEOUT_SECONDS = float(os.getenv("LILI_TIMEOUT_SECONDS", "60"))
 
 # -----------------------------
-# Models
+# OpenAI-like request models
 # -----------------------------
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -43,7 +62,7 @@ class ChatCompletionsRequest(BaseModel):
     model: str = "lili-workflow"
     messages: List[ChatMessage] = Field(min_length=1)
     stream: bool = False
-    user: Optional[str] = None
+    user: Optional[str] = None  # BP currently sends None (per your logs)
 
 
 # -----------------------------
@@ -51,21 +70,23 @@ class ChatCompletionsRequest(BaseModel):
 # -----------------------------
 def _extract_text_from_content(content: Any) -> str:
     """
-    Supports:
-    - "text"
-    - [{"type":"text","text":"..."}]
-    - {"text":"..."} / {"content":"..."} (defensive)
+    Supports common OpenAI formats:
+    - "hello"
+    - [{"type":"text","text":"hello"}]
+    - {"text":"hello"} / {"content":"hello"} (defensive)
     """
     if content is None:
         return ""
     if isinstance(content, str):
         return content.strip()
+
     if isinstance(content, dict):
         for k in ("text", "content", "value", "message"):
             v = content.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
         return ""
+
     if isinstance(content, list):
         parts: List[str] = []
         for item in content:
@@ -76,6 +97,7 @@ def _extract_text_from_content(content: Any) -> str:
                 if isinstance(v, str) and v.strip():
                     parts.append(v.strip())
         return "\n".join(parts).strip()
+
     return str(content).strip()
 
 
@@ -88,31 +110,21 @@ def last_user_message(messages: List[ChatMessage]) -> str:
     return ""
 
 
-def _empty_chat_completion(model: str) -> Dict[str, Any]:
-    created = int(time.time())
-    stream_id = f"chatcmpl-{uuid.uuid4().hex}"
-    return {
-        "id": stream_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": ""},
-                "finish_reason": "stop",
-            }
-        ],
-    }
-
 def stable_sender_id(body: ChatCompletionsRequest, request: Request) -> str:
-    # 1) Prefer explicit user field (if BP sends it)
+    """
+    BP does not send body.user (you confirmed BODY.user=None), so we derive a stable id.
+    Use x-forwarded-for (client IP as seen by Railway edge) + user-agent.
+
+    This is "session-ish" stability for BP server-to-server calls; it won't map perfectly
+    to a human end-user unless BP provides a conversation id header.
+    """
+    # 1) If BP ever sends body.user, use it.
     if body.user and body.user.strip():
         return body.user.strip()
 
     h = request.headers
 
-    # 2) Prefer stable session headers if BP provides any (you’ll see in your logs)
+    # 2) If BP provides any stable conversation/session header in the future, prefer it.
     for key in (
         "x-session-id",
         "x-call-id",
@@ -124,45 +136,80 @@ def stable_sender_id(body: ChatCompletionsRequest, request: Request) -> str:
         if v and v.strip():
             return v.strip()
 
-    # 3) Last resort: deterministic fingerprint (better than per-turn uuid)
-    client_ip = request.client.host if request.client else "unknown"
+    # 3) Last resort: x-forwarded-for + user-agent
+    xff = h.get("x-forwarded-for", "")
+    client_ip = xff.split(",")[0].strip() if xff else "unknown"
     ua = h.get("user-agent", "unknown")
+
     fp = f"{client_ip}|{ua}"
     return hashlib.sha256(fp.encode("utf-8")).hexdigest()[:32]
 
+
+def _empty_chat_completion(model: str) -> Dict[str, Any]:
+    created = int(time.time())
+    stream_id = f"chatcmpl-{uuid.uuid4().hex}"
+    return {
+        "id": stream_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+    }
+
+
+def _openai_sse_event(stream_id: str, created: int, model: str, delta: Dict[str, Any], finish_reason: Optional[str]):
+    return {
+        "id": stream_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
 # -----------------------------
-# Exception logging (keeps Railway logs useful)
+# Diagnostics endpoints
 # -----------------------------
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "lili_endpoint": LILI_ENDPOINT,
+        "workflow_id": LILI_WORKFLOW_ID,
+    }
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     try:
         raw = await request.body()
         logger.error(
-            f"HTTPException {exc.status_code} on {request.url.path} "
-            f"detail={exc.detail} body={raw.decode('utf-8', errors='replace')}"
+            "HTTPException %s on %s detail=%s body=%s",
+            exc.status_code,
+            request.url.path,
+            exc.detail,
+            raw.decode("utf-8", errors="replace"),
         )
     except Exception:
-        logger.error(
-            f"HTTPException {exc.status_code} on {request.url.path} detail={exc.detail} (could not read body)"
-        )
+        logger.error("HTTPException %s on %s detail=%s (could not read body)", exc.status_code, request.url.path, exc.detail)
+
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 # -----------------------------
-# Main endpoint
+# Main endpoint: BP -> Adapter -> Lili -> Adapter -> BP
 # -----------------------------
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionsRequest, request: Request):
-    print("BP request stream =", body.stream)
-     # TEMP DEBUG: log candidate session headers
-    logger.info("headers=%s", dict(request.headers))
-    logger.info("BODY.user=%r", getattr(body, "user", None))
-    logger.info("BODY.user=%r", body.user)
-    logger.info("BODY keys=%s", list(body.model_dump().keys()))
+    # Useful debug, but keep it minimal
+    logger.info("BP request stream=%s", body.stream)
+    logger.info("headers.user-agent=%r x-forwarded-for=%r", request.headers.get("user-agent"), request.headers.get("x-forwarded-for"))
+    logger.info("BODY.user=%r keys=%s", body.user, list(body.model_dump().keys()))
 
     user_text = last_user_message(body.messages).strip()
+    logger.info("extracted user_text=%r", user_text)
 
-    
+    # BP sometimes sends warm-ups with empty content. Do NOT 400.
     if not user_text:
         if not body.stream:
             return JSONResponse(_empty_chat_completion(body.model))
@@ -171,159 +218,83 @@ async def chat_completions(body: ChatCompletionsRequest, request: Request):
             created = int(time.time())
             stream_id = f"chatcmpl-{uuid.uuid4().hex}"
 
-            init_event = {
-                "id": stream_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": body.model,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(init_event, ensure_ascii=False)}\n\n"
-
-            final_event = {
-                "id": stream_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": body.model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps(_openai_sse_event(stream_id, created, body.model, {'role': 'assistant'}, None), ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps(_openai_sse_event(stream_id, created, body.model, {}, 'stop'), ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
             empty_sse(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
 
     sender_id = stable_sender_id(body, request)
 
-    payload: Dict[str, Any] = {
+    # IMPORTANT:
+    # We intentionally call Lili non-streaming always, then adapt to BP stream/non-stream.
+    lili_payload: Dict[str, Any] = {
         "workflow_id": str(LILI_WORKFLOW_ID),
         "sender_id": sender_id,
         "user_message": user_text,
-        # Ask Lili to stream if BP asked us to stream
-        "stream": bool(body.stream),  
+        "stream": False,  # keep upstream simple and deterministic for BP
     }
+
+    logger.info("about to call Lili: workflow_id=%s sender_id=%s stream=%s", LILI_WORKFLOW_ID, sender_id, body.stream)
+
+    # Call Lili
+    try:
+        async with httpx.AsyncClient(timeout=LILI_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                LILI_ENDPOINT,
+                json=lili_payload,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+            )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream Lili request failed: {str(e)}") from e
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Lili error {resp.status_code}: {resp.text}")
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"Lili returned non-JSON: {resp.text}")
+
+    assistant_text = (data.get("message") or data.get("error") or "").strip()
 
     created = int(time.time())
     stream_id = f"chatcmpl-{uuid.uuid4().hex}"
 
-    # -----------------------------
-    # Streaming response (proxy + fallback)
-    # -----------------------------
-    async def sse_proxy():
-        # 1) role chunk
-        init_event = {
-            "id": stream_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": body.model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        }
-        yield f"data: {json.dumps(init_event, ensure_ascii=False)}\n\n"
+    # Non-streaming OpenAI response
+    if not body.stream:
+        return JSONResponse(
+            {
+                "id": stream_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": body.model,
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": assistant_text}, "finish_reason": "stop"}
+                ],
+            }
+        )
 
-        sent_any_content = False
+    # Streaming OpenAI SSE response (BP expects deltas)
+    async def sse_gen():
+        # Role chunk
+        yield f"data: {json.dumps(_openai_sse_event(stream_id, created, body.model, {'role': 'assistant'}, None), ensure_ascii=False)}\n\n"
 
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("POST", LILI_ENDPOINT, json=payload) as resp:
-                if resp.status_code >= 400:
-                    err_text = await resp.aread()
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"Lili error {resp.status_code}: {err_text.decode(errors='replace')}",
-                    )
+        # Content chunk (single chunk; enough for BP to speak reliably)
+        if assistant_text:
+            logger.info("emit_delta len=%d preview=%r", len(assistant_text), assistant_text[:80])
+            yield f"data: {json.dumps(_openai_sse_event(stream_id, created, body.model, {'content': assistant_text}, None), ensure_ascii=False)}\n\n"
 
-                # Attempt to parse streamed lines from Lili (SSE, NDJSON, or plain tokens)
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-
-                    # If Lili returns SSE like: "data: {...}"
-                    if line.startswith("data:"):
-                        line = line[len("data:"):].strip()
-
-                    # Common terminators
-                    if line in ("[DONE]", "DONE"):
-                        break
-
-                    token: Optional[str] = None
-
-                    # Try JSON decode first
-                    try:
-                        obj = json.loads(line)
-                        if isinstance(obj, dict):
-                            token = obj.get("delta") or obj.get("token") or obj.get("text") or obj.get("content")
-                        elif isinstance(obj, str):
-                            token = obj
-                    except Exception:
-                        # plain text token
-                        token = line
-
-                    if not token:
-                        continue
-
-                    event = {
-                        "id": stream_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": body.model,
-                        "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
-                    }
-                    sent_any_content = True
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-        # Fallback: if Lili streaming produced no tokens, do a non-streaming call and emit one content chunk.
-        if not sent_any_content:
-            fallback_payload = dict(payload)
-            fallback_payload["stream"] = False
-
-            try:
-                async with httpx.AsyncClient(timeout=LILI_TIMEOUT_SECONDS) as c2:
-                    r2 = await c2.post(LILI_ENDPOINT, json=fallback_payload)
-            except httpx.RequestError:
-                r2 = None
-
-            assistant_text = ""
-            if r2 is not None and r2.status_code < 400:
-                try:
-                    d2 = r2.json()
-                    assistant_text = (d2.get("message") or d2.get("error") or "").strip()
-                except Exception:
-                    assistant_text = ""
-
-            if assistant_text:
-                fallback_event = {
-                    "id": stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": body.model,
-                    "choices": [{"index": 0, "delta": {"content": assistant_text}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(fallback_event, ensure_ascii=False)}\n\n"
-                sent_any_content = True
-
-        # 3) stop chunk + DONE
-        final_event = {
-            "id": stream_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": body.model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        }
-        yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
+        # Stop + DONE
+        yield f"data: {json.dumps(_openai_sse_event(stream_id, created, body.model, {}, 'stop'), ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
-        sse_proxy(),
+        sse_gen(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
